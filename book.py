@@ -63,7 +63,17 @@ REG_FEE_BPS = D("8")
 
 
 def money(x: Decimal) -> Decimal:
-    """2 decimal places, half away from zero. Not round(), which is half-even."""
+    """2 decimal places, half away from zero. Not round(), which is half-even.
+
+    Decimal("NaN") parses successfully and quantizes to NaN without raising
+    -- unlike Decimal("Infinity"), which quantize() already rejects. Left
+    unchecked, a NaN payload value threads silently through every leg and
+    only surfaces as an uncaught AssertionError in _post()'s dr/cr compare,
+    crashing the whole client instead of being rejected like any other
+    payload that will not parse.
+    """
+    if not x.is_finite():
+        raise InvalidOperation(f"non-finite amount: {x}")
     return x.quantize(D("0.01"), rounding=ROUND_HALF_UP)
 
 
@@ -139,6 +149,12 @@ class Book:
         # as_of_event_id checkpoint (Tasksheet.md section 3) answerable --
         # replay a fresh Book up through that event and snapshot it there.
         self.event_log: list[dict] = []
+
+        # order_ids whose terminal order_filled has already been processed.
+        # A fill may arrive before its own placement (Tasksheet.md section
+        # 5); if order_placed then arrives for an order already closed this
+        # way, it must not resurrect a hold/open_order_routes entry for it.
+        self.closed_orders: set[str] = set()
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -319,7 +335,14 @@ class Book:
         brokers trading this asset_class, ties broken by broker id
         ascending. Fills name their own broker; this decision is only ever
         read back for a checkpoint's open_order_routes.
+
+        A fill may arrive before its own placement. If this order_id's
+        terminal fill already happened, the order is already closed --
+        creating a hold/route for it now would resurrect state a
+        checkpoint must no longer report.
         """
+        if p["order_id"] in self.closed_orders:
+            return []
         quantity = D(p["quantity"])
         notional = quantity * D(p["limit_price"])
         hold = (money(notional + D(p.get("est_charges", 0)))
@@ -465,6 +488,12 @@ class Book:
         # produced it -- true for both sides.
         self.trades[p["trade_id"]] = {
             "customer_id": cid, "principal": principal, "side": p["side"]}
+
+        if ev["type"] == "order_filled":
+            # Recorded regardless of whether a hold currently exists -- a
+            # fill may arrive before its own placement, and order_placed
+            # must still know this order is already closed when it does.
+            self.closed_orders.add(p["order_id"])
 
         hold = self.holds.get(p["order_id"])
         if hold is not None:
