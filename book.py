@@ -25,6 +25,42 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 D = Decimal
 ZERO = D("0.00")
 
+# -- new accounts, Tasksheet.md section 2 ------------------------------------
+# The eleven accounts already in use (1100..4200) are unchanged and stay as
+# literals at their existing call sites; only the accounts introduced by
+# Tasksheet.md are named here, for later passes to post to.
+ACCT_CUSTODIAN_FEES_PAYABLE = "2420"
+ACCT_PARTNER_SHARE_PAYABLE = "2430"
+ACCT_CUSTODY_REVENUE = "4010"
+ACCT_BROKERAGE_COST = "5000"
+ACCT_CUSTODY_COST = "5010"
+ACCT_PARTNER_REVENUE_SHARE = "5100"
+
+# Per-broker tariff, Tasksheet.md section 4 ("The tariff"). bps figures are
+# per unit of principal; brokerage is floored at min_fee; ticket is a flat
+# per-fill cost on top. payable_account is that broker's own 241x account,
+# where its accrued broker cost is mirrored on the credit side.
+BROKER_TARIFF = {
+    "BRK-A": {"asset_classes": {"equity", "etf"},
+              "brokerage_bps": D("20"), "custody_bps": D("4"),
+              "broker_cost_bps": D("9"), "custody_cost_bps": D("2"),
+              "min_fee": D("1.00"), "ticket": D("0.35"),
+              "payable_account": "2411"},
+    "BRK-B": {"asset_classes": {"equity", "bond"},
+              "brokerage_bps": D("15"), "custody_bps": D("5"),
+              "broker_cost_bps": D("8"), "custody_cost_bps": D("3"),
+              "min_fee": D("2.50"), "ticket": D("3.00"),
+              "payable_account": "2412"},
+    "BRK-C": {"asset_classes": {"etf", "bond"},
+              "brokerage_bps": D("25"), "custody_bps": D("3"),
+              "broker_cost_bps": D("12"), "custody_cost_bps": D("1"),
+              "min_fee": D("0.50"), "ticket": D("0.20"),
+              "payable_account": "2413"},
+}
+
+# Regulatory fee, Tasksheet.md section 4: 8 bps of principal, every fill.
+REG_FEE_BPS = D("8")
+
 
 def money(x: Decimal) -> Decimal:
     """2 decimal places, half away from zero. Not round(), which is half-even."""
@@ -56,6 +92,12 @@ class Book:
         # Holds are never posted as legs, so nothing in balances can reconstruct
         # them; this is the only source for a checkpoint's cash_hold.
         self.holds: dict[str, dict] = {}
+
+        # order_id -> broker_id, decided at order_placed by the routing rule
+        # (Tasksheet.md "Routing"). Fills name their own broker directly, so
+        # this is read only for a checkpoint's open_order_routes -- the only
+        # place the routing decision is ours to report.
+        self.order_routes: dict[str, str] = {}
 
         # (customer_id, symbol) -> FIFO queue of lots, each {"lot_id", "quantity", "cost"}.
         # Sells consume lots in delivery order, not just by running total, and a
@@ -91,6 +133,13 @@ class Book:
         # the run: the client keeps consuming and tells you the list at the end.
         self.todo: dict[str, int] = defaultdict(int)
 
+        # Every event ever handed to apply(), in the exact order received.
+        # apply() is the only door an event enters through, so this is the
+        # only place able to record delivery order; it is what makes an
+        # as_of_event_id checkpoint (Tasksheet.md section 3) answerable --
+        # replay a fresh Book up through that event and snapshot it there.
+        self.event_log: list[dict] = []
+
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
         """Post one event and return its legs.
@@ -99,6 +148,7 @@ class Book:
         deliberately re-send several hundred events partway through the run.
         Posting twice is the single most expensive mistake available here.
         """
+        self.event_log.append(ev)
         eid = ev["event_id"]
         if eid in self.seen:
             return []                      # already posted; nothing new happens
@@ -260,12 +310,19 @@ class Book:
 
     def on_order_placed(self, p, ev):
         """No legs: a placement moves no money. It creates a hold -- for a
-        buy, cash of quantity * limit_price + est_commission is no longer
+        buy, cash of quantity * limit_price + est_charges is no longer
         spendable; a sell holds the shares instead, which carries no cash
         figure. Holds are reported at checkpoints, never posted.
+
+        Also decides the route: the broker with the lowest total customer
+        charge (brokerage + custody) on quantity * limit_price, among
+        brokers trading this asset_class, ties broken by broker id
+        ascending. Fills name their own broker; this decision is only ever
+        read back for a checkpoint's open_order_routes.
         """
         quantity = D(p["quantity"])
-        hold = (money(quantity * D(p["limit_price"]) + D(p.get("est_commission", 0)))
+        notional = quantity * D(p["limit_price"])
+        hold = (money(notional + D(p.get("est_charges", 0)))
                 if p["side"] == "buy" else ZERO)
         self.holds[p["order_id"]] = {
             "customer_id": p["customer_id"],
@@ -273,39 +330,86 @@ class Book:
             "order_quantity": quantity,
             "remaining_hold": hold,
         }
+
+        asset_class = p["asset_class"]
+        best_broker, best_charge = None, None
+        for broker_id in sorted(BROKER_TARIFF):
+            tariff = BROKER_TARIFF[broker_id]
+            if asset_class not in tariff["asset_classes"]:
+                continue
+            brokerage = max(money(notional * tariff["brokerage_bps"] / D("10000")),
+                             tariff["min_fee"])
+            custody = money(notional * tariff["custody_bps"] / D("10000"))
+            charge = brokerage + custody
+            if best_charge is None or charge < best_charge:
+                best_broker, best_charge = broker_id, charge
+        self.order_routes[p["order_id"]] = best_broker
+
         return []
 
     def on_order_partially_filled(self, p, ev):
         return self.on_order_filled(p, ev)
 
     def on_order_filled(self, p, ev):
-        """buy: Dr 2010 principal+commission, Dr 1200 principal /
-        Cr 2350 principal, Cr 2100 principal, Cr 4000 commission.
-        sell: Dr 1150 principal, Dr 2100 FIFO cost / Cr 2010
-        principal-commission-reg, Cr 1200 cost, Cr 4000 commission,
-        Cr 2400 reg. Cash does NOT move on the trade date either way --
-        trade_settled discharges the obligation two days later.
+        """buy: Dr 2010 P+b+c+r, Dr 1200 P, Dr 5000 bc, Dr 5010 cc,
+        Dr 5100 ps / Cr 2350 P, Cr 2100 P, Cr 4000 b, Cr 4010 c, Cr 2400 r,
+        Cr 241x bc, Cr 2420 cc, Cr 2430 ps. sell: Dr 1150 P, Dr 2100 FIFO
+        cost, Dr 5000 bc, Dr 5010 cc, Dr 5100 ps / Cr 2010 P-b-c-r,
+        Cr 1200 cost, Cr 4000 b, Cr 4010 c, Cr 2400 r, Cr 241x bc,
+        Cr 2420 cc, Cr 2430 ps -- revenue, cost, regulatory and partner
+        economics are identical on both sides (Tasksheet.md section 4);
+        only what the customer's wallet is charged against differs. Cash
+        does NOT move on the trade date either way -- trade_settled
+        discharges the P-only obligation two days later.
         """
         cid = p["customer_id"]
         quantity = D(p["quantity"])
         principal = money(D(p["principal"]))
-        commission = money(D(p.get("commission", 0)))
+
+        # The fee amounts are never in the payload -- broker and principal
+        # are, and the tariff (Tasksheet.md "The tariff") turns those into
+        # money. Each derived amount is rounded to the cent independently
+        # before use; the ticket is already cent-exact and adds on top of
+        # the bps-derived broker cost, not rounded again with it.
+        tariff = BROKER_TARIFF[p["broker"]]
+        brokerage = max(money(principal * tariff["brokerage_bps"] / D("10000")),
+                         tariff["min_fee"])
+        custody = money(principal * tariff["custody_bps"] / D("10000"))
+        reg = money(principal * REG_FEE_BPS / D("10000"))
+        broker_cost = (money(principal * tariff["broker_cost_bps"] / D("10000"))
+                        + tariff["ticket"])
+        custody_cost = money(principal * tariff["custody_cost_bps"] / D("10000"))
+        # partner_rate x (revenue - cost); floored at zero, never clawed back
+        # -- a ticket fee makes roughly a quarter of fills loss-making.
+        partner_share = max(
+            money(D(p["partner_rate"])
+                  * (brokerage + custody - broker_cost - custody_cost)),
+            ZERO)
+        payable_account = tariff["payable_account"]
 
         if p["side"] == "buy":
-            # One lot per fill, cost is principal only -- commission is the
-            # firm's income, never part of the cost basis (protocol section 4).
-            # Identity is this event's own event_id: already unique, and a
-            # future reversal will need to name this exact lot.
+            # One lot per fill, cost is principal only -- none of the
+            # tariff charges are part of the cost basis (Tasksheet.md
+            # section 4). Identity is this event's own event_id: already
+            # unique, and a future reversal will need to name this exact lot.
             self.lots[(cid, p["symbol"])].append(
                 {"lot_id": ev["event_id"], "quantity": quantity, "cost": principal})
             self.lot_locations[ev["event_id"]] = (cid, p["symbol"])
 
             legs = [
-                leg("2010", cid, debit=principal + commission),
+                leg("2010", cid, debit=principal + brokerage + custody + reg),
                 leg("2350", cid, credit=principal),
                 leg("1200", cid, debit=principal),
                 leg("2100", cid, credit=principal),
-                leg("4000", cid, credit=commission),
+                leg("5000", cid, debit=broker_cost),
+                leg("4000", cid, credit=brokerage),
+                leg("5010", cid, debit=custody_cost),
+                leg("4010", cid, credit=custody),
+                leg("5100", cid, debit=partner_share),
+                leg("2400", cid, credit=reg),
+                leg(payable_account, cid, credit=broker_cost),
+                leg("2420", cid, credit=custody_cost),
+                leg("2430", cid, credit=partner_share),
             ]
 
         elif p["side"] == "sell":
@@ -337,14 +441,20 @@ class Book:
                     queue.popleft()
             self.sell_consumption[ev["event_id"]] = manifest
 
-            reg = money(principal * D("0.0008"))
             legs = [
                 leg("1150", cid, debit=principal),
-                leg("2010", cid, credit=principal - commission - reg),
+                leg("2010", cid, credit=principal - brokerage - custody - reg),
                 leg("2100", cid, debit=cost),
                 leg("1200", cid, credit=cost),
-                leg("4000", cid, credit=commission),
+                leg("5000", cid, debit=broker_cost),
+                leg("4000", cid, credit=brokerage),
+                leg("5010", cid, debit=custody_cost),
+                leg("4010", cid, credit=custody),
+                leg("5100", cid, debit=partner_share),
                 leg("2400", cid, credit=reg),
+                leg(payable_account, cid, credit=broker_cost),
+                leg("2420", cid, credit=custody_cost),
+                leg("2430", cid, credit=partner_share),
             ]
 
         else:
@@ -394,6 +504,64 @@ class Book:
 
     def on_order_rejected(self, p, ev):
         return self.on_order_cancelled(p, ev)
+
+    def on_broker_fees_settled(self, p, ev):
+        """Discharges that broker's accumulated fees for this customer, paid
+        out of omnibus cash. The amount is never in the payload -- it is
+        whatever self.balances already holds on that broker's 241x account
+        (Tasksheet.md "Paying it all onward"). Settling nothing outstanding
+        is an error.
+
+            Dr 241x outstanding        Cr 1100 outstanding
+        """
+        cid = p["customer_id"]
+        tariff = BROKER_TARIFF.get(p["broker"])
+        if tariff is None:
+            raise Rejected("unknown broker")
+        account = tariff["payable_account"]
+        outstanding = -self.balances.get((cid, account), ZERO)
+        if outstanding == ZERO:
+            raise Rejected("nothing outstanding on that account")
+        return [leg(account, cid, debit=outstanding),
+                leg("1100", cid, credit=outstanding)]
+
+    def on_custodian_fees_settled(self, p, ev):
+        """Discharges the custodian's accumulated fees for this customer.
+
+            Dr 2420 outstanding        Cr 1100 outstanding
+        """
+        cid = p["customer_id"]
+        outstanding = -self.balances.get((cid, ACCT_CUSTODIAN_FEES_PAYABLE), ZERO)
+        if outstanding == ZERO:
+            raise Rejected("nothing outstanding on that account")
+        return [leg(ACCT_CUSTODIAN_FEES_PAYABLE, cid, debit=outstanding),
+                leg("1100", cid, credit=outstanding)]
+
+    def on_reg_fees_remitted(self, p, ev):
+        """Remits the regulatory fees collected for this customer, owed
+        onward to the venue.
+
+            Dr 2400 outstanding        Cr 1100 outstanding
+        """
+        cid = p["customer_id"]
+        outstanding = -self.balances.get((cid, "2400"), ZERO)
+        if outstanding == ZERO:
+            raise Rejected("nothing outstanding on that account")
+        return [leg("2400", cid, debit=outstanding),
+                leg("1100", cid, credit=outstanding)]
+
+    def on_partner_payout(self, p, ev):
+        """Pays out the introducing partner's accumulated share for this
+        customer.
+
+            Dr 2430 outstanding        Cr 1100 outstanding
+        """
+        cid = p["customer_id"]
+        outstanding = -self.balances.get((cid, ACCT_PARTNER_SHARE_PAYABLE), ZERO)
+        if outstanding == ZERO:
+            raise Rejected("nothing outstanding on that account")
+        return [leg(ACCT_PARTNER_SHARE_PAYABLE, cid, debit=outstanding),
+                leg("1100", cid, credit=outstanding)]
 
     def on_dividend_cash(self, p, ev):
         """Tax is withheld at source; only the net ever reaches us and we
@@ -512,13 +680,31 @@ class Book:
                 for l in original_legs]
 
     # -- reporting ----------------------------------------------------------
-    def snapshot(self) -> dict:
-        """What a checkpoint_request wants: your whole state, right now.
+    def snapshot(self, as_of_event_id: str | None = None) -> dict:
+        """What a checkpoint_request wants: your whole state, right now --
+        or, if as_of_event_id is given, your state as it stood once that
+        event (and nothing delivered after it) had been processed.
+
+        Current state alone can't answer an as-of query, and nothing here
+        keeps a snapshot per event, so the event log is replayed through a
+        fresh Book up to and including the first delivery of that event_id;
+        a later duplicate delivery of the same id is correctly not needed,
+        since replaying through the first one already reflects its effect.
+        That fresh Book is then asked for its own (unqualified) snapshot.
 
         Report every account you have ever posted to, including any that have
         netted back to zero. Trial balance values are debit-positive, so
         liabilities carry a negative sign.
         """
+        if as_of_event_id is not None:
+            cutoff = next((i for i, e in enumerate(self.event_log)
+                           if e["event_id"] == as_of_event_id),
+                          len(self.event_log) - 1)
+            replay = Book()
+            for e in self.event_log[:cutoff + 1]:
+                replay.apply(e)
+            return replay.snapshot()
+
         tb: dict[str, Decimal] = defaultdict(lambda: ZERO)
         for (_cid, acct), bal in self.balances.items():
             tb[acct] += bal
@@ -552,6 +738,13 @@ class Book:
                                 "cash_hold": str(money(c["cash_hold"])),
                                 "positions": c["positions"]}
                           for cid, c in sorted(customers.items())},
+            # self.holds holds exactly the still-open orders -- a fill that
+            # closes an order or a cancellation/rejection removes it there,
+            # matching "orders you have seen filled or cancelled do not
+            # belong here" (Tasksheet.md section 3).
+            "open_order_routes": {oid: self.order_routes[oid]
+                                   for oid in sorted(self.holds)
+                                   if oid in self.order_routes},
         }
 
 
